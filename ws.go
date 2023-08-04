@@ -3,6 +3,9 @@ package twitch
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
+
 	"github.com/gorilla/websocket"
 )
 
@@ -16,33 +19,31 @@ const (
 )
 
 var (
-	ErrNoConnection         = errors.New("no connection to websocket")
-	ErrFailedReadingMessage = errors.New("failed to read message from websocket")
-	ErrChannelDoesNotExist  = errors.New("channel is not in the channel list")
+	ErrNoConnection = errors.New("no connection to websocket")
 )
 
 type Client struct {
-	channels    []*channel
-	wsEndpoint  string
-	connection  *websocket.Conn
-	accessToken string
+	wsEndpoint   string
+	connection   *websocket.Conn
+	accessToken  string
+	capabilities []string
+	username     string
 }
 
-type channel struct {
+type Channel struct {
 	channelName string
-	messages    chan []byte
-	errors      chan error
 	context     context.Context
 	cancel      context.CancelFunc
 }
 
 type ClientOpts struct {
-	Tls      bool
-	Channels []string
+	Tls          bool
+	Capabilities []string
+	Username     string
 }
 
 // Create a new client for connecting to Twitch's WS servers
-func NewClient(accessToken string, opts *ClientOpts) *Client {
+func NewClient(username string, accessToken string, opts *ClientOpts) *Client {
 	client := &Client{}
 	wsEndpoint := wsTwitchTLS
 
@@ -52,18 +53,18 @@ func NewClient(accessToken string, opts *ClientOpts) *Client {
 
 	client.wsEndpoint = wsEndpoint
 	client.accessToken = accessToken
-	for _, channelName := range opts.Channels {
-		context, cancel := context.WithCancel(context.Background())
-		channel := &channel{
-			channelName: channelName,
-			messages:    make(chan []byte),
-			errors:      make(chan error),
-			context:     context,
-			cancel:      cancel,
-		}
-		client.channels = append(client.channels, channel)
-	}
+	client.username = username
 	return client
+}
+
+func NewChannel(channelName string) *Channel {
+	context, cancel := context.WithCancel(context.Background())
+	channel := &Channel{
+		channelName: channelName,
+		context:     context,
+		cancel:      cancel,
+	}
+	return channel
 }
 
 func (ctx *Client) Connect() error {
@@ -73,6 +74,27 @@ func (ctx *Client) Connect() error {
 	}
 
 	ctx.connection = conn
+	return ctx.authenticateWithTwitchWS()
+}
+
+func (ctx *Client) authenticateWithTwitchWS() error {
+	capabilities := strings.Join(ctx.capabilities, " ")
+	if err := ctx.sendTextMessage(fmt.Sprintf("CAP REQ :%s\r\n", capabilities)); err != nil {
+		return err
+	}
+	if err := ctx.sendTextMessage(fmt.Sprintf("PASS oauth:%s\r\n", ctx.accessToken)); err != nil {
+		return err
+	}
+	if err := ctx.sendTextMessage(fmt.Sprintf("NICK %s\r\n", ctx.username)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (ctx *Client) sendTextMessage(message string) error {
+	if err := ctx.connection.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -89,60 +111,48 @@ func (ctx *Client) Disconnect() error {
 	return nil
 }
 
-// Return a channel which will have all the messages of the channels
-// output into.
-func (ctx *Client) Read() <-chan []byte {
-	output := make(chan []byte)
-
-	for _, channel := range ctx.channels {
-		go ctx.readMessages(output, channel.errors, channel.context)
+// Read chat messages from the channel.
+//
+// This should be run as a goroutine.
+//
+// Pass in an output and errors channel to ingest the incoming chat messages or errors
+func (c *Channel) ReadMessages(client *Client, output chan<- []byte, errors chan<- error) {
+	if err := c.joinChannel(client); err != nil {
+		errors <- err
 	}
 
-	return output
-}
-
-// Stop reading the messages for a particular channel
-func (ctx *Client) StopReading(channelName string) error {
-	for _, channel := range ctx.channels {
-		if channel.channelName == channelName {
-			channel.cancel()
-			return nil
-		}
-	}
-
-	return ErrChannelDoesNotExist
-}
-
-func (ctx *Client) RemoveChannel(channelName string) error {
-	for index, channel := range ctx.channels {
-		if channel.channelName == channelName {
-			channel.cancel()
-			close(channel.messages)
-			close(channel.errors)
-			ctx.channels = removeChannel(ctx.channels, index)
-			return nil
-		}
-	}
-
-	return ErrChannelDoesNotExist
-}
-
-func removeChannel(slice []*channel, index int) []*channel {
-	return append(slice[:index], slice[index+1:]...)
-}
-
-func (ctx *Client) readMessages(messages chan<- []byte, errors chan<- error, ctxCancel context.Context) {
 	for {
 		select {
-		case <-ctxCancel.Done():
+		case <-c.context.Done():
+			if err := c.leaveChannel(client); err != nil {
+				errors <- err
+			}
 			return
 		default:
-			_, message, err := ctx.connection.ReadMessage()
+			_, message, err := client.connection.ReadMessage()
 			if err != nil {
 				errors <- err
 				break
 			}
-			messages <- message
+			output <- message
 		}
 	}
+}
+
+func (c *Channel) StopReadingMessages() {
+	c.cancel()
+}
+
+func (c *Channel) joinChannel(client *Client) error {
+	if err := client.connection.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("JOIN #%s\r\n", strings.ToLower(c.channelName)))); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *Channel) leaveChannel(client *Client) error {
+	if err := client.connection.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("PART #%s\r\n", strings.ToLower(c.channelName)))); err != nil {
+		return err
+	}
+	return nil
 }
