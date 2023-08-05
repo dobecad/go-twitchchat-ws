@@ -2,9 +2,13 @@ package twitch
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -19,10 +23,12 @@ const (
 )
 
 var (
-	ErrNoConnection = errors.New("no connection to websocket")
+	ErrNoConnection  = errors.New("no connection to websocket")
+	ErrNoPingContent = errors.New("no ping content")
 )
 
 type Client struct {
+	mu           sync.Mutex
 	wsEndpoint   string
 	connection   *websocket.Conn
 	accessToken  string
@@ -39,7 +45,6 @@ type Channel struct {
 type ClientOpts struct {
 	Tls          bool
 	Capabilities []string
-	Username     string
 }
 
 // Create a new client for connecting to Twitch's WS servers
@@ -68,7 +73,19 @@ func NewChannel(channelName string) *Channel {
 }
 
 func (ctx *Client) Connect() error {
-	conn, _, err := websocket.DefaultDialer.Dial(ctx.wsEndpoint, nil)
+	var dialer *websocket.Dialer
+
+	dialer = &websocket.Dialer{
+		Proxy:            http.ProxyFromEnvironment,
+		HandshakeTimeout: 30 * time.Second,
+		ReadBufferSize:   512,
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	}
+
+	header := http.Header{}
+	conn, _, err := dialer.Dial(ctx.wsEndpoint, header)
 	if err != nil {
 		return err
 	}
@@ -79,20 +96,34 @@ func (ctx *Client) Connect() error {
 
 func (ctx *Client) authenticateWithTwitchWS() error {
 	capabilities := strings.Join(ctx.capabilities, " ")
-	if err := ctx.sendTextMessage(fmt.Sprintf("CAP REQ :%s\r\n", capabilities)); err != nil {
+	if err := ctx.sendTextMessage(fmt.Sprintf("CAP REQ :%s", capabilities)); err != nil {
 		return err
 	}
-	if err := ctx.sendTextMessage(fmt.Sprintf("PASS oauth:%s\r\n", ctx.accessToken)); err != nil {
+	if err := ctx.sendTextMessage(fmt.Sprintf("PASS oauth:%s", ctx.accessToken)); err != nil {
 		return err
 	}
-	if err := ctx.sendTextMessage(fmt.Sprintf("NICK %s\r\n", ctx.username)); err != nil {
+	if err := ctx.sendTextMessage(fmt.Sprintf("NICK %s", ctx.username)); err != nil {
 		return err
 	}
 	return nil
 }
 
 func (ctx *Client) sendTextMessage(message string) error {
+	// Need mutex to prevent concurrent writes to websocket connection
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+
 	if err := ctx.connection.WriteMessage(websocket.TextMessage, []byte(message)); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (ctx *Client) sendPongMessage(message string) error {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+
+	if err := ctx.connection.WriteMessage(websocket.PongMessage, []byte(message)); err != nil {
 		return err
 	}
 	return nil
@@ -102,6 +133,9 @@ func (ctx *Client) Disconnect() error {
 	if ctx.connection == nil {
 		return ErrNoConnection
 	}
+
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
 
 	err := ctx.connection.Close()
 	if err != nil {
@@ -116,42 +150,108 @@ func (ctx *Client) Disconnect() error {
 // This should be run as a goroutine.
 //
 // Pass in an output and errors channel to ingest the incoming chat messages or errors
-func (c *Channel) ReadMessages(client *Client, output chan<- []byte, errors chan<- error) {
-	if err := c.joinChannel(client); err != nil {
-		errors <- err
+func (c *Channel) ReadMessages(client *Client, output chan<- []byte, error_out chan<- error) {
+	if err := client.joinChannel(c.channelName); err != nil {
+		error_out <- err
+		return
 	}
+
+	// When the context is canceled, the goroutine may still be in the
+	// process of reading a message from the WebSocket connection
+	// which could result in a "use of closed network connection" error.
+	// To avoid this issue, ensure that the goroutine stops reading from
+	// the connection immediately after the context is canceled.
+	// One way to achieve this is by using a separate done channel
+	// to signal the goroutine to stop reading when the context is canceled.
 
 	for {
 		select {
 		case <-c.context.Done():
-			if err := c.leaveChannel(client); err != nil {
-				errors <- err
+			if err := client.leaveChannel(c.channelName); err != nil {
+				error_out <- err
 			}
 			return
 		default:
-			_, message, err := client.connection.ReadMessage()
-			if err != nil {
-				errors <- err
-				break
+			// Use a separate goroutine for reading from the connection
+			// This is to prevent cancelling the goroutine in the middle of reading
+			// a message from the websocket
+			messageCh := make(chan []byte, 1)
+			errorCh := make(chan error, 2)
+			go func() {
+				messageType, message, err := client.connection.ReadMessage()
+				if err != nil {
+					if closeErr, ok := err.(*websocket.CloseError); ok {
+						errorCh <- fmt.Errorf("websocket connection closed with code %d: %s", closeErr.Code, closeErr.Text)
+					}
+					errorCh <- fmt.Errorf("error reading message from connection for channel %s: %s", c.channelName, err)
+				} else {
+					if messageType == websocket.TextMessage {
+						if err := client.handleTextMessage(string(message)); err != nil {
+							errorCh <- err
+						}
+					}
+					messageCh <- message
+				}
+			}()
+
+			// Wait for either a message or an error, or until the context is canceled
+			select {
+			case <-c.context.Done():
+				if err := client.leaveChannel(c.channelName); err != nil {
+					errorCh <- err
+				}
+				return
+			case err := <-errorCh:
+				error_out <- err
+				close(messageCh)
+				close(errorCh)
+				return
+			case message := <-messageCh:
+				output <- message
 			}
-			output <- message
+
+			// Close the messageCh and errorCh to release resources
+			close(messageCh)
+			close(errorCh)
 		}
 	}
 }
 
-func (c *Channel) StopReadingMessages() {
+func (c *Client) handleTextMessage(message string) error {
+	msg := string(message)
+	if strings.HasPrefix(message, "PING") {
+		pingContent, err := parsePingContent(msg)
+		if err != nil {
+			return err
+		}
+		if err := c.sendPongMessage(pingContent); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parsePingContent(message string) (string, error) {
+	pingMsg := strings.SplitN(message, " ", 2)
+	if len(pingMsg) == 2 {
+		return pingMsg[1], nil
+	}
+	return "", ErrNoPingContent
+}
+
+func (c *Channel) StopReadingMessages(client *Client) {
 	c.cancel()
 }
 
-func (c *Channel) joinChannel(client *Client) error {
-	if err := client.connection.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("JOIN #%s\r\n", strings.ToLower(c.channelName)))); err != nil {
+func (c *Client) joinChannel(channelName string) error {
+	if err := c.sendTextMessage(fmt.Sprintf("JOIN #%s", strings.ToLower(channelName))); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (c *Channel) leaveChannel(client *Client) error {
-	if err := client.connection.WriteMessage(websocket.TextMessage, []byte(fmt.Sprintf("PART #%s\r\n", strings.ToLower(c.channelName)))); err != nil {
+func (c *Client) leaveChannel(channelName string) error {
+	if err := c.sendTextMessage(fmt.Sprintf("PART #%s", strings.ToLower(channelName))); err != nil {
 		return err
 	}
 	return nil
