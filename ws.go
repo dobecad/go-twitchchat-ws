@@ -23,8 +23,8 @@ const (
 )
 
 var (
-	ErrNoConnection  = errors.New("no connection to websocket")
-	ErrNoPingContent = errors.New("no ping content")
+	ErrNoConnection     = errors.New("no connection to websocket")
+	ErrNoPingContent    = errors.New("no ping content")
 	ErrChannelNotJoined = errors.New("client is not currently connected to given channel")
 )
 
@@ -146,11 +146,9 @@ func (ctx *Client) Disconnect() error {
 //
 // Pass in an output and errors channel to ingest the incoming chat messages or errors
 func (c *Client) ReadMessages(output chan<- []byte, error_out chan<- error) {
-	for _, channel := range c.channels {
-		if err := c.JoinChannel(channel); err != nil {
-			error_out <- err
-			return
-		}
+	if err := c.joinChannels(); err != nil {
+		error_out <- err
+		return
 	}
 
 	// When the context is canceled, the goroutine may still be in the
@@ -175,14 +173,19 @@ func (c *Client) ReadMessages(output chan<- []byte, error_out chan<- error) {
 			// This is to prevent cancelling the goroutine in the middle of reading
 			// a message from the websocket
 			messageCh := make(chan []byte, 1)
-			errorCh := make(chan error, 2)
+			errorCh := make(chan error, 10)
 			go func() {
 				messageType, message, err := c.connection.ReadMessage()
 				if err != nil {
 					if closeErr, ok := err.(*websocket.CloseError); ok {
-						errorCh <- fmt.Errorf("websocket connection closed with code %d: %s", closeErr.Code, closeErr.Text)
+						if err := c.reconnect(5); err != nil {
+							errorCh <- fmt.Errorf("websocket connection closed with code %d: %s", closeErr.Code, closeErr.Text)
+						}
+						if err := c.joinChannels(); err != nil {
+							errorCh <- err
+						}
+						messageCh <- []byte("reconnected to websocket")
 					}
-					errorCh <- fmt.Errorf("error reading message from connection for channel: %s", err)
 				} else {
 					if messageType == websocket.TextMessage {
 						if err := c.handleTextMessage(string(message)); err != nil {
@@ -216,6 +219,29 @@ func (c *Client) ReadMessages(output chan<- []byte, error_out chan<- error) {
 			close(errorCh)
 		}
 	}
+}
+
+func (c *Client) joinChannels() error {
+	for _, channel := range c.channels {
+		if err := c.JoinChannel(channel); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) reconnect(retryAttempts uint8) error {
+	c.connection = nil
+	for i := 0; i < 5; i++ {
+		fmt.Printf("attempting to reconnect to websocket")
+		if err := c.Connect(); err == nil {
+			fmt.Printf("reconnect successful")
+			return nil
+		}
+		time.Sleep((1 << uint(i)) * time.Second)
+	}
+
+	return fmt.Errorf("websocket connection could not be re-established")
 }
 
 func (c *Client) handleTextMessage(message string) error {
