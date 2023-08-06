@@ -77,12 +77,15 @@ func (ctx *Client) Connect() error {
 	}
 
 	header := http.Header{}
+	ctx.mu.Lock()
 	conn, _, err := dialer.Dial(ctx.wsEndpoint, header)
 	if err != nil {
+		ctx.mu.Unlock()
 		return err
 	}
 
 	ctx.connection = conn
+	ctx.mu.Unlock()
 	if err := ctx.authenticateWithTwitchWS(); err != nil {
 		return err
 	}
