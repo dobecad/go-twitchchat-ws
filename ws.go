@@ -25,6 +25,7 @@ const (
 var (
 	ErrNoConnection  = errors.New("no connection to websocket")
 	ErrNoPingContent = errors.New("no ping content")
+	ErrChannelNotJoined = errors.New("client is not currently connected to given channel")
 )
 
 type Client struct {
@@ -34,17 +35,15 @@ type Client struct {
 	accessToken  string
 	capabilities []string
 	username     string
-}
-
-type Channel struct {
-	channelName string
-	context     context.Context
-	cancel      context.CancelFunc
+	channels     []string
+	context      context.Context
+	cancel       context.CancelFunc
 }
 
 type ClientOpts struct {
 	Tls          bool
 	Capabilities []string
+	Channels     []string
 }
 
 // Create a new client for connecting to Twitch's WS servers
@@ -56,26 +55,19 @@ func NewClient(username string, accessToken string, opts *ClientOpts) *Client {
 		wsEndpoint = wsTwitch
 	}
 
+	context, cancel := context.WithCancel(context.Background())
 	client.wsEndpoint = wsEndpoint
 	client.accessToken = accessToken
 	client.username = username
+	client.context = context
+	client.cancel = cancel
+	client.channels = opts.Channels
+	client.capabilities = opts.Capabilities
 	return client
 }
 
-func NewChannel(channelName string) *Channel {
-	context, cancel := context.WithCancel(context.Background())
-	channel := &Channel{
-		channelName: channelName,
-		context:     context,
-		cancel:      cancel,
-	}
-	return channel
-}
-
 func (ctx *Client) Connect() error {
-	var dialer *websocket.Dialer
-
-	dialer = &websocket.Dialer{
+	dialer := &websocket.Dialer{
 		Proxy:            http.ProxyFromEnvironment,
 		HandshakeTimeout: 30 * time.Second,
 		ReadBufferSize:   512,
@@ -91,7 +83,10 @@ func (ctx *Client) Connect() error {
 	}
 
 	ctx.connection = conn
-	return ctx.authenticateWithTwitchWS()
+	if err := ctx.authenticateWithTwitchWS(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (ctx *Client) authenticateWithTwitchWS() error {
@@ -150,10 +145,13 @@ func (ctx *Client) Disconnect() error {
 // This should be run as a goroutine.
 //
 // Pass in an output and errors channel to ingest the incoming chat messages or errors
-func (c *Channel) ReadMessages(client *Client, output chan<- []byte, error_out chan<- error) {
-	if err := client.joinChannel(c.channelName); err != nil {
-		error_out <- err
-		return
+func (c *Client) ReadMessages(output chan<- []byte, error_out chan<- error) {
+	for _, channel := range c.channels {
+		fmt.Printf("Joining channel: ", channel)
+		if err := c.JoinChannel(channel); err != nil {
+			error_out <- err
+			return
+		}
 	}
 
 	// When the context is canceled, the goroutine may still be in the
@@ -167,8 +165,10 @@ func (c *Channel) ReadMessages(client *Client, output chan<- []byte, error_out c
 	for {
 		select {
 		case <-c.context.Done():
-			if err := client.leaveChannel(c.channelName); err != nil {
-				error_out <- err
+			for _, channel := range c.channels {
+				if err := c.LeaveChannel(channel); err != nil {
+					error_out <- err
+				}
 			}
 			return
 		default:
@@ -178,15 +178,15 @@ func (c *Channel) ReadMessages(client *Client, output chan<- []byte, error_out c
 			messageCh := make(chan []byte, 1)
 			errorCh := make(chan error, 2)
 			go func() {
-				messageType, message, err := client.connection.ReadMessage()
+				messageType, message, err := c.connection.ReadMessage()
 				if err != nil {
 					if closeErr, ok := err.(*websocket.CloseError); ok {
 						errorCh <- fmt.Errorf("websocket connection closed with code %d: %s", closeErr.Code, closeErr.Text)
 					}
-					errorCh <- fmt.Errorf("error reading message from connection for channel %s: %s", c.channelName, err)
+					errorCh <- fmt.Errorf("error reading message from connection for channel: %s", err)
 				} else {
 					if messageType == websocket.TextMessage {
-						if err := client.handleTextMessage(string(message)); err != nil {
+						if err := c.handleTextMessage(string(message)); err != nil {
 							errorCh <- err
 						}
 					}
@@ -197,8 +197,10 @@ func (c *Channel) ReadMessages(client *Client, output chan<- []byte, error_out c
 			// Wait for either a message or an error, or until the context is canceled
 			select {
 			case <-c.context.Done():
-				if err := client.leaveChannel(c.channelName); err != nil {
-					errorCh <- err
+				for _, channel := range c.channels {
+					if err := c.LeaveChannel(channel); err != nil {
+						errorCh <- err
+					}
 				}
 				return
 			case err := <-errorCh:
@@ -239,20 +241,25 @@ func parsePingContent(message string) (string, error) {
 	return "", ErrNoPingContent
 }
 
-func (c *Channel) StopReadingMessages(client *Client) {
+func (c *Client) StopReadingMessages() {
 	c.cancel()
 }
 
-func (c *Client) joinChannel(channelName string) error {
+func (c *Client) JoinChannel(channelName string) error {
 	if err := c.sendTextMessage(fmt.Sprintf("JOIN #%s", strings.ToLower(channelName))); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (c *Client) leaveChannel(channelName string) error {
-	if err := c.sendTextMessage(fmt.Sprintf("PART #%s", strings.ToLower(channelName))); err != nil {
-		return err
+func (c *Client) LeaveChannel(channelName string) error {
+	for _, channel := range c.channels {
+		if channelName == channel {
+			if err := c.sendTextMessage(fmt.Sprintf("PART #%s", strings.ToLower(channelName))); err != nil {
+				return err
+			}
+			return nil
+		}
 	}
-	return nil
+	return ErrChannelNotJoined
 }
