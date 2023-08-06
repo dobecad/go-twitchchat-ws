@@ -147,7 +147,6 @@ func (ctx *Client) Disconnect() error {
 // Pass in an output and errors channel to ingest the incoming chat messages or errors
 func (c *Client) ReadMessages(output chan<- []byte, error_out chan<- error) {
 	for _, channel := range c.channels {
-		fmt.Printf("Joining channel: ", channel)
 		if err := c.JoinChannel(channel); err != nil {
 			error_out <- err
 			return
