@@ -117,16 +117,6 @@ func (ctx *Client) sendTextMessage(message string) error {
 	return nil
 }
 
-func (ctx *Client) sendPongMessage(message string) error {
-	ctx.mu.Lock()
-	defer ctx.mu.Unlock()
-
-	if err := ctx.connection.WriteMessage(websocket.PongMessage, []byte(message)); err != nil {
-		return err
-	}
-	return nil
-}
-
 func (ctx *Client) Disconnect() error {
 	if ctx.connection == nil {
 		return ErrNoConnection
@@ -254,7 +244,7 @@ func (c *Client) handleTextMessage(message string) error {
 		if err != nil {
 			return err
 		}
-		if err := c.sendPongMessage(pingContent); err != nil {
+		if err := c.sendTextMessage(fmt.Sprintf("PONG %s", pingContent)); err != nil {
 			return err
 		}
 	}
