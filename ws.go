@@ -41,9 +41,14 @@ type Client struct {
 }
 
 type ClientOpts struct {
-	Tls          bool
+	// Connect to Twitch TLS WS endpoint or non-TLS WS endpoint
+	Tls bool
+
+	// Specify which capabilities you want
 	Capabilities []string
-	Channels     []string
+
+	// Specify channel names you want to join initially
+	Channels []string
 }
 
 // Create a new client for connecting to Twitch's WS servers
@@ -66,6 +71,7 @@ func NewClient(username string, accessToken string, opts *ClientOpts) *Client {
 	return client
 }
 
+// Establish an authenticated connection with Twitch WS server
 func (ctx *Client) Connect() error {
 	dialer := &websocket.Dialer{
 		Proxy:            http.ProxyFromEnvironment,
@@ -92,6 +98,7 @@ func (ctx *Client) Connect() error {
 	return nil
 }
 
+// Send the required messages in order to authenticate with Twitch
 func (ctx *Client) authenticateWithTwitchWS() error {
 	capabilities := strings.Join(ctx.capabilities, " ")
 	if err := ctx.sendTextMessage(fmt.Sprintf("CAP REQ :%s", capabilities)); err != nil {
@@ -106,6 +113,7 @@ func (ctx *Client) authenticateWithTwitchWS() error {
 	return nil
 }
 
+// Send a text message to the Twitch WS endpoint
 func (ctx *Client) sendTextMessage(message string) error {
 	// Need mutex to prevent concurrent writes to websocket connection
 	ctx.mu.Lock()
@@ -117,6 +125,7 @@ func (ctx *Client) sendTextMessage(message string) error {
 	return nil
 }
 
+// Disconnect from the Twitch WS
 func (ctx *Client) Disconnect() error {
 	if ctx.connection == nil {
 		return ErrNoConnection
@@ -137,7 +146,7 @@ func (ctx *Client) Disconnect() error {
 //
 // This should be run as a goroutine.
 //
-// Pass in an output and errors channel to ingest the incoming chat messages or errors
+// Pass in an output and errors channel to ingest the incoming chat messages and errors
 func (c *Client) ReadMessages(output chan<- []byte, error_out chan<- error) {
 	if err := c.joinChannels(); err != nil {
 		error_out <- err
@@ -214,6 +223,7 @@ func (c *Client) ReadMessages(output chan<- []byte, error_out chan<- error) {
 	}
 }
 
+// Join all of the channels saved in the client
 func (c *Client) joinChannels() error {
 	for _, channel := range c.channels {
 		if err := c.JoinChannel(channel); err != nil {
@@ -223,6 +233,7 @@ func (c *Client) joinChannels() error {
 	return nil
 }
 
+// Reconnect the WS
 func (c *Client) reconnect(retryAttempts uint8) error {
 	c.connection = nil
 	for i := 0; i < 5; i++ {
@@ -263,19 +274,25 @@ func (c *Client) StopReadingMessages() {
 	c.cancel()
 }
 
+// Join a new channel to recieve messages for
 func (c *Client) JoinChannel(channelName string) error {
-	if err := c.sendTextMessage(fmt.Sprintf("JOIN #%s", strings.ToLower(channelName))); err != nil {
+	formattedChannelName := strings.ToLower(channelName)
+	if err := c.sendTextMessage(fmt.Sprintf("JOIN #%s", formattedChannelName)); err != nil {
 		return err
 	}
+	c.channels = append(c.channels, formattedChannelName)
 	return nil
 }
 
+// Leave a channel so that you no longer recieve that channels messages
 func (c *Client) LeaveChannel(channelName string) error {
-	for _, channel := range c.channels {
-		if channelName == channel {
-			if err := c.sendTextMessage(fmt.Sprintf("PART #%s", strings.ToLower(channelName))); err != nil {
+	formattedChannelName := strings.ToLower(channelName)
+	for index, channel := range c.channels {
+		if formattedChannelName == channel {
+			if err := c.sendTextMessage(fmt.Sprintf("PART #%s", formattedChannelName)); err != nil {
 				return err
 			}
+			c.channels = append(c.channels[:index], c.channels[index+1:]...)
 			return nil
 		}
 	}
