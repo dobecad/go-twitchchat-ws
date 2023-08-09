@@ -1,6 +1,6 @@
 # go-twitchchat-ws
 
-Go library for connecting to twitch chat via web sockets
+Go library for connecting to Twitch chat via web sockets
 
 ## Import
 ```
